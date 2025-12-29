@@ -39,14 +39,13 @@ This tool solves all of these problems.
 git clone https://github.com/YOUR_USERNAME/langgraph-threads-migration.git
 cd langgraph-threads-migration
 
-# Install dependencies
+# Using uv (recommended)
+uv venv
+source .venv/bin/activate
+uv pip install -r requirements.txt
+
+# Or using pip
 pip install -r requirements.txt
-
-# Or install manually
-pip install langgraph-sdk rich python-dotenv
-
-# For PostgreSQL support (optional)
-pip install asyncpg
 ```
 
 ## Configuration
@@ -221,6 +220,25 @@ Built-in delays (0.2-0.3s) prevent API overload. For large exports (1000+ thread
 | `PermissionDeniedError` | Use Service Key (`lsv2_sk_...`), not Personal Token |
 | `ConflictError (409)` | Thread already exists (automatically skipped) |
 | `asyncpg not installed` | Run `pip install asyncpg` for PostgreSQL support |
+
+## Project Structure
+
+```
+langgraph-threads-migration/
+├── migrate_threads.py          # CLI entry point
+├── langgraph_export/           # Main package
+│   ├── __init__.py
+│   ├── client.py               # LangGraph SDK wrapper
+│   ├── migrator.py             # Thread migration orchestrator
+│   ├── models.py               # SQLAlchemy models for PostgreSQL
+│   └── exporters/              # Export backends
+│       ├── base.py             # Abstract base exporter
+│       ├── json_exporter.py    # JSON file export
+│       └── postgres_exporter.py # PostgreSQL export
+├── requirements.txt
+├── .env.example
+└── LICENSE
+```
 
 ## Contributing
 
