@@ -1,31 +1,29 @@
 #!/usr/bin/env python3
 """
-LangGraph Cloud Threads Migration Tool
+LangGraph Threads Export Tool
 
-Migrate threads (conversations) between LangGraph Cloud deployments while preserving
-thread IDs, metadata (including owner for multi-tenancy), and conversation history.
+Export threads, checkpoints, and conversation history from LangGraph Cloud deployments.
+Save to JSON file, PostgreSQL database, or migrate to another deployment.
 
 Usage:
     # Export threads to JSON file
     python migrate_threads.py --source-url <URL> --export-json threads.json
 
+    # Export threads to PostgreSQL database
+    python migrate_threads.py --source-url <URL> --export-postgres
+
     # Migrate threads between deployments
     python migrate_threads.py --source-url <SOURCE> --target-url <TARGET> --migrate
-
-    # Import threads from JSON file
-    python migrate_threads.py --target-url <URL> --import-json threads.json
 
     # Full migration (export + import + validate)
     python migrate_threads.py --source-url <SOURCE> --target-url <TARGET> --full
 
-    # Test with single thread first
-    python migrate_threads.py --source-url <SOURCE> --target-url <TARGET> --full --test-single
-
 Requirements:
-    pip install langgraph-sdk rich python-dotenv
+    pip install langgraph-sdk rich python-dotenv asyncpg
 
 Configuration:
     Set LANGSMITH_API_KEY in .env file or pass via --api-key argument.
+    Set DATABASE_URL in .env file for PostgreSQL export.
 """
 
 import argparse
@@ -49,6 +47,111 @@ from rich.panel import Panel
 load_dotenv()
 
 console = Console()
+
+# PostgreSQL support (optional)
+try:
+    import asyncpg
+    POSTGRES_AVAILABLE = True
+except ImportError:
+    POSTGRES_AVAILABLE = False
+
+
+class PostgresExporter:
+    """Export threads to PostgreSQL database."""
+
+    def __init__(self, database_url: str):
+        self.database_url = database_url
+        self.pool = None
+
+    async def connect(self):
+        """Create connection pool."""
+        self.pool = await asyncpg.create_pool(self.database_url)
+        await self._create_tables()
+
+    async def close(self):
+        """Close connection pool."""
+        if self.pool:
+            await self.pool.close()
+
+    async def _create_tables(self):
+        """Create tables if they don't exist."""
+        async with self.pool.acquire() as conn:
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS langgraph_threads (
+                    id SERIAL PRIMARY KEY,
+                    thread_id VARCHAR(255) UNIQUE NOT NULL,
+                    metadata JSONB DEFAULT '{}',
+                    values JSONB DEFAULT '{}',
+                    created_at TIMESTAMP,
+                    updated_at TIMESTAMP,
+                    source_url TEXT,
+                    exported_at TIMESTAMP DEFAULT NOW()
+                );
+
+                CREATE TABLE IF NOT EXISTS langgraph_checkpoints (
+                    id SERIAL PRIMARY KEY,
+                    thread_id VARCHAR(255) NOT NULL REFERENCES langgraph_threads(thread_id) ON DELETE CASCADE,
+                    checkpoint_id VARCHAR(255),
+                    parent_checkpoint_id VARCHAR(255),
+                    checkpoint_data JSONB DEFAULT '{}',
+                    values JSONB DEFAULT '{}',
+                    metadata JSONB DEFAULT '{}',
+                    created_at TIMESTAMP,
+                    UNIQUE(thread_id, checkpoint_id)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_threads_thread_id ON langgraph_threads(thread_id);
+                CREATE INDEX IF NOT EXISTS idx_threads_metadata ON langgraph_threads USING GIN(metadata);
+                CREATE INDEX IF NOT EXISTS idx_checkpoints_thread_id ON langgraph_checkpoints(thread_id);
+            """)
+
+    async def export_thread(self, thread_data: Dict[str, Any], source_url: str):
+        """Export a single thread to PostgreSQL."""
+        async with self.pool.acquire() as conn:
+            # Insert thread
+            await conn.execute("""
+                INSERT INTO langgraph_threads (thread_id, metadata, values, created_at, updated_at, source_url)
+                VALUES ($1, $2, $3, $4, $5, $6)
+                ON CONFLICT (thread_id) DO UPDATE SET
+                    metadata = EXCLUDED.metadata,
+                    values = EXCLUDED.values,
+                    updated_at = EXCLUDED.updated_at,
+                    exported_at = NOW()
+            """,
+                thread_data.get("thread_id"),
+                json.dumps(thread_data.get("metadata", {})),
+                json.dumps(thread_data.get("values", {})),
+                thread_data.get("created_at"),
+                thread_data.get("updated_at"),
+                source_url
+            )
+
+            # Insert checkpoints from history
+            for checkpoint in thread_data.get("history", []):
+                await conn.execute("""
+                    INSERT INTO langgraph_checkpoints
+                    (thread_id, checkpoint_id, parent_checkpoint_id, checkpoint_data, values, metadata, created_at)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7)
+                    ON CONFLICT (thread_id, checkpoint_id) DO UPDATE SET
+                        checkpoint_data = EXCLUDED.checkpoint_data,
+                        values = EXCLUDED.values,
+                        metadata = EXCLUDED.metadata
+                """,
+                    thread_data.get("thread_id"),
+                    checkpoint.get("checkpoint_id"),
+                    checkpoint.get("parent_checkpoint_id"),
+                    json.dumps(checkpoint.get("checkpoint", {})),
+                    json.dumps(checkpoint.get("values", {})),
+                    json.dumps(checkpoint.get("metadata", {})),
+                    checkpoint.get("created_at")
+                )
+
+    async def get_stats(self) -> Dict[str, int]:
+        """Get export statistics."""
+        async with self.pool.acquire() as conn:
+            threads = await conn.fetchval("SELECT COUNT(*) FROM langgraph_threads")
+            checkpoints = await conn.fetchval("SELECT COUNT(*) FROM langgraph_checkpoints")
+            return {"threads": threads, "checkpoints": checkpoints}
 
 
 class LangGraphClient:
@@ -113,7 +216,7 @@ class LangGraphClient:
 
 
 class ThreadMigrator:
-    """Thread migration manager."""
+    """Thread migration and export manager."""
 
     def __init__(
         self,
@@ -121,23 +224,28 @@ class ThreadMigrator:
         target_url: Optional[str],
         api_key: str,
         backup_file: str = "threads_backup.json",
+        database_url: Optional[str] = None,
         dry_run: bool = False,
         test_single: bool = False,
     ):
         self.source_client = LangGraphClient(source_url, api_key) if source_url else None
         self.target_client = LangGraphClient(target_url, api_key) if target_url else None
         self.backup_file = Path(backup_file)
+        self.database_url = database_url
+        self.postgres_exporter = None
         self.dry_run = dry_run
         self.test_single = test_single
 
     async def close(self):
-        """Close HTTP clients."""
+        """Close HTTP clients and database connections."""
         if self.source_client:
             await self.source_client.close()
         if self.target_client:
             await self.target_client.close()
+        if self.postgres_exporter:
+            await self.postgres_exporter.close()
 
-    async def export_threads(self) -> List[Dict[str, Any]]:
+    async def export_threads(self, to_postgres: bool = False) -> List[Dict[str, Any]]:
         """Export all threads from source deployment."""
         if not self.source_client:
             console.print("[red]✗ Source URL required for export[/red]")
@@ -157,6 +265,19 @@ class ThreadMigrator:
                     border_style="cyan",
                 )
             )
+
+        # Initialize PostgreSQL if needed
+        if to_postgres:
+            if not POSTGRES_AVAILABLE:
+                console.print("[red]✗ asyncpg not installed. Run: pip install asyncpg[/red]")
+                return []
+            if not self.database_url:
+                console.print("[red]✗ DATABASE_URL required for PostgreSQL export[/red]")
+                return []
+
+            self.postgres_exporter = PostgresExporter(self.database_url)
+            await self.postgres_exporter.connect()
+            console.print("[green]✓[/green] Connected to PostgreSQL")
 
         all_threads = []
         offset = 0
@@ -204,6 +325,7 @@ class ThreadMigrator:
 
         # Enrich with details and history
         enriched_threads = []
+        total_checkpoints = 0
 
         with Progress(
             SpinnerColumn(),
@@ -213,7 +335,7 @@ class ThreadMigrator:
             console=console,
         ) as progress:
             task = progress.add_task(
-                "[cyan]Fetching thread details...", total=len(all_threads)
+                "[cyan]Fetching thread details & checkpoints...", total=len(all_threads)
             )
 
             for thread_summary in all_threads:
@@ -225,19 +347,26 @@ class ThreadMigrator:
                     # Get full thread details
                     thread_details = await self.source_client.get_thread(thread_id)
 
-                    # Get thread history
+                    # Get thread history (checkpoints)
                     history = await self.source_client.get_thread_history(thread_id)
+                    total_checkpoints += len(history)
 
-                    enriched_threads.append(
-                        {
-                            "thread_id": thread_id,
-                            "metadata": thread_details.get("metadata", {}),
-                            "created_at": thread_details.get("created_at"),
-                            "updated_at": thread_details.get("updated_at"),
-                            "history": history,
-                            "values": thread_details.get("values", {}),
-                        }
-                    )
+                    thread_data = {
+                        "thread_id": thread_id,
+                        "metadata": thread_details.get("metadata", {}),
+                        "created_at": thread_details.get("created_at"),
+                        "updated_at": thread_details.get("updated_at"),
+                        "history": history,
+                        "values": thread_details.get("values", {}),
+                    }
+
+                    enriched_threads.append(thread_data)
+
+                    # Export to PostgreSQL if enabled
+                    if to_postgres and self.postgres_exporter:
+                        await self.postgres_exporter.export_thread(
+                            thread_data, self.source_client.base_url
+                        )
 
                     progress.update(task, advance=1)
                     await asyncio.sleep(0.2)  # Rate limiting
@@ -248,21 +377,32 @@ class ThreadMigrator:
                     )
                     continue
 
-        # Save to JSON file
+        # Save to JSON file (always, as backup)
         backup_data = {
             "export_date": datetime.now().isoformat(),
             "source": self.source_client.base_url,
             "total_threads": len(enriched_threads),
+            "total_checkpoints": total_checkpoints,
             "threads": enriched_threads,
         }
 
         self.backup_file.write_text(json.dumps(backup_data, indent=2, ensure_ascii=False))
         console.print(
-            f"[green]✓[/green] Backup saved: [bold]{self.backup_file}[/bold]"
+            f"[green]✓[/green] JSON backup saved: [bold]{self.backup_file}[/bold]"
         )
         console.print(
             f"[green]✓[/green] Size: {self.backup_file.stat().st_size / 1024 / 1024:.2f} MB"
         )
+        console.print(
+            f"[green]✓[/green] Total checkpoints exported: {total_checkpoints}"
+        )
+
+        # Show PostgreSQL stats if used
+        if to_postgres and self.postgres_exporter:
+            stats = await self.postgres_exporter.get_stats()
+            console.print(
+                f"[green]✓[/green] PostgreSQL: {stats['threads']} threads, {stats['checkpoints']} checkpoints"
+            )
 
         return enriched_threads
 
@@ -417,12 +557,15 @@ class ThreadMigrator:
 
 async def main():
     parser = argparse.ArgumentParser(
-        description="LangGraph Cloud Threads Migration Tool",
+        description="LangGraph Threads Export Tool - Export threads, checkpoints, and history",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
   # Export threads to JSON only
   python migrate_threads.py --source-url https://my-prod.langgraph.app --export-json backup.json
+
+  # Export threads to PostgreSQL database
+  python migrate_threads.py --source-url https://my-prod.langgraph.app --export-postgres
 
   # Full migration between deployments
   python migrate_threads.py \\
@@ -430,7 +573,7 @@ Examples:
     --target-url https://my-dev.langgraph.app \\
     --full
 
-  # Import from JSON file
+  # Import from JSON file to another deployment
   python migrate_threads.py --target-url https://my-dev.langgraph.app --import-json backup.json
 
   # Test with single thread first
@@ -450,9 +593,18 @@ Examples:
         help="LangSmith API key (or set LANGSMITH_API_KEY in .env)",
     )
     parser.add_argument(
+        "--database-url",
+        help="PostgreSQL connection URL (or set DATABASE_URL in .env)",
+    )
+    parser.add_argument(
         "--export-json",
         metavar="FILE",
-        help="Export threads to JSON file (no import)",
+        help="Export threads to JSON file",
+    )
+    parser.add_argument(
+        "--export-postgres",
+        action="store_true",
+        help="Export threads to PostgreSQL database",
     )
     parser.add_argument(
         "--import-json",
@@ -462,7 +614,7 @@ Examples:
     parser.add_argument(
         "--migrate",
         action="store_true",
-        help="Migrate threads from source to target",
+        help="Migrate threads from source to target deployment",
     )
     parser.add_argument(
         "--full",
@@ -501,9 +653,20 @@ Examples:
         )
         sys.exit(1)
 
+    # Load database URL from .env if not provided
+    database_url = args.database_url or os.getenv("DATABASE_URL")
+
     # Validate arguments
     if args.export_json and not args.source_url:
         console.print("[red]✗ --source-url required for export[/red]")
+        sys.exit(1)
+
+    if args.export_postgres and not args.source_url:
+        console.print("[red]✗ --source-url required for export[/red]")
+        sys.exit(1)
+
+    if args.export_postgres and not database_url:
+        console.print("[red]✗ --database-url or DATABASE_URL in .env required for PostgreSQL export[/red]")
         sys.exit(1)
 
     if args.import_json and not args.target_url:
@@ -514,17 +677,17 @@ Examples:
         console.print("[red]✗ Both --source-url and --target-url required for migration[/red]")
         sys.exit(1)
 
-    if not any([args.export_json, args.import_json, args.migrate, args.full, args.validate]):
+    if not any([args.export_json, args.export_postgres, args.import_json, args.migrate, args.full, args.validate]):
         parser.print_help()
         console.print(
-            "\n[yellow]⚠ Specify an action: --export-json, --import-json, --migrate, --full, or --validate[/yellow]"
+            "\n[yellow]⚠ Specify an action: --export-json, --export-postgres, --import-json, --migrate, --full, or --validate[/yellow]"
         )
         sys.exit(1)
 
     # Display header
     console.print(
         Panel.fit(
-            "[bold magenta]🔄 LangGraph Threads Migration Tool[/bold magenta]",
+            "[bold magenta]🔄 LangGraph Threads Export Tool[/bold magenta]",
             border_style="magenta",
         )
     )
@@ -540,17 +703,22 @@ Examples:
         target_url=args.target_url,
         api_key=api_key,
         backup_file=backup_file,
+        database_url=database_url,
         dry_run=args.dry_run,
         test_single=args.test_single,
     )
 
     try:
         if args.export_json:
-            # Export only
-            await migrator.export_threads()
+            # Export to JSON only
+            await migrator.export_threads(to_postgres=False)
+
+        elif args.export_postgres:
+            # Export to PostgreSQL (and JSON as backup)
+            await migrator.export_threads(to_postgres=True)
 
         elif args.import_json:
-            # Import only
+            # Import from JSON
             await migrator.import_threads()
 
         elif args.full:
@@ -569,7 +737,7 @@ Examples:
             await migrator.validate_migration()
 
     except KeyboardInterrupt:
-        console.print("\n[yellow]⚠ Migration interrupted by user[/yellow]")
+        console.print("\n[yellow]⚠ Operation interrupted by user[/yellow]")
         sys.exit(1)
 
     except Exception as e:

@@ -1,23 +1,36 @@
-# LangGraph Threads Migration Tool
+# LangGraph Threads Export Tool
 
-A Python tool to migrate threads (conversations) between LangGraph Cloud deployments while preserving thread IDs, metadata, and conversation history.
+A Python tool to export threads, checkpoints, and conversation history from LangGraph Cloud deployments. Save your data to JSON files, PostgreSQL databases, or migrate directly to another deployment.
+
+## Why This Tool?
+
+LangGraph Cloud stores your conversation threads and checkpoints, but there's no built-in way to:
+- **Backup your data** before deleting a deployment
+- **Migrate conversations** between environments (prod → dev)
+- **Store threads in your own database** for analytics or compliance
+- **Download conversation history** as JSON for processing
+
+This tool solves all of these problems.
 
 ## Features
 
-- **Export threads to JSON** - Download all threads as a backup file
-- **Import threads from JSON** - Restore threads from a backup file
+- **Export to JSON** - Download all threads and checkpoints as a backup file
+- **Export to PostgreSQL** - Store threads in your own database with proper schema
 - **Migrate between deployments** - Transfer threads from one LangGraph Cloud deployment to another
-- **Multi-tenancy support** - Preserves `metadata.owner` so users keep access to their own threads
-- **Test mode** - Migrate a single thread first to verify everything works
+- **Preserve everything** - Thread IDs, metadata (including `owner` for multi-tenancy), checkpoints, and conversation history
+- **Test mode** - Export/migrate a single thread first to verify everything works
 - **Dry-run mode** - Preview changes without making any modifications
 - **Progress tracking** - Real-time progress bars and detailed summaries
 
 ## Use Cases
 
-- **Cost optimization**: Migrate from an expensive production deployment to a cheaper one
-- **Environment migration**: Move threads from staging to production or vice versa
-- **Backup & restore**: Create JSON backups of all conversations
-- **Disaster recovery**: Restore threads after accidental deletion
+| Scenario | Command |
+|----------|---------|
+| Backup before deleting deployment | `--export-json backup.json` |
+| Cost optimization (expensive → cheaper deployment) | `--full` |
+| Store in your own PostgreSQL | `--export-postgres` |
+| Environment migration (staging → prod) | `--migrate` |
+| Disaster recovery | `--import-json backup.json` |
 
 ## Installation
 
@@ -31,26 +44,36 @@ pip install -r requirements.txt
 
 # Or install manually
 pip install langgraph-sdk rich python-dotenv
+
+# For PostgreSQL support (optional)
+pip install asyncpg
 ```
 
 ## Configuration
 
-Create a `.env` file with your LangSmith API key:
+Create a `.env` file:
 
 ```bash
 cp .env.example .env
-# Edit .env and add your LANGSMITH_API_KEY
 ```
 
-Your API key can be found at [smith.langchain.com](https://smith.langchain.com/) → Settings → API Keys.
+Edit `.env` with your credentials:
 
-> **Note**: Use a Service Key (`lsv2_sk_...`) for deployment access, not a Personal Token.
+```bash
+# Required: LangSmith API key
+LANGSMITH_API_KEY=lsv2_sk_your_api_key_here
+
+# Optional: PostgreSQL connection URL (for --export-postgres)
+DATABASE_URL=postgresql://user:password@localhost:5432/dbname
+```
+
+> **Note**: Use a Service Key (`lsv2_sk_...`) from [smith.langchain.com](https://smith.langchain.com/) → Settings → API Keys
 
 ## Usage
 
-### Export threads to JSON file
+### Export to JSON file
 
-Download all threads from a deployment as a backup:
+Download all threads and checkpoints as a backup:
 
 ```bash
 python migrate_threads.py \
@@ -58,19 +81,23 @@ python migrate_threads.py \
   --export-json threads_backup.json
 ```
 
-### Import threads from JSON file
+### Export to PostgreSQL
 
-Restore threads to a deployment from a backup file:
+Store threads in your own database:
 
 ```bash
 python migrate_threads.py \
-  --target-url https://my-deployment.langgraph.app \
-  --import-json threads_backup.json
+  --source-url https://my-deployment.langgraph.app \
+  --export-postgres
 ```
 
-### Full migration between deployments
+This creates two tables:
+- `langgraph_threads` - Thread metadata and current state
+- `langgraph_checkpoints` - Full checkpoint history
 
-Export from source, import to target, and validate:
+### Migrate between deployments
+
+Transfer all threads from one deployment to another:
 
 ```bash
 python migrate_threads.py \
@@ -79,39 +106,25 @@ python migrate_threads.py \
   --full
 ```
 
+### Import from JSON
+
+Restore threads from a backup file:
+
+```bash
+python migrate_threads.py \
+  --target-url https://my-deployment.langgraph.app \
+  --import-json threads_backup.json
+```
+
 ### Test with a single thread first
 
-Always recommended before a full migration:
+Always recommended before a full operation:
 
 ```bash
 python migrate_threads.py \
   --source-url https://my-prod.langgraph.app \
-  --target-url https://my-dev.langgraph.app \
-  --full \
+  --export-json test.json \
   --test-single
-```
-
-### Dry-run mode
-
-Preview what would happen without making changes:
-
-```bash
-python migrate_threads.py \
-  --source-url https://my-prod.langgraph.app \
-  --target-url https://my-dev.langgraph.app \
-  --full \
-  --dry-run
-```
-
-### Validate migration
-
-Compare thread counts between source and target:
-
-```bash
-python migrate_threads.py \
-  --source-url https://my-prod.langgraph.app \
-  --target-url https://my-dev.langgraph.app \
-  --validate
 ```
 
 ## Command Reference
@@ -121,20 +134,68 @@ python migrate_threads.py \
 | `--source-url` | Source LangGraph Cloud deployment URL |
 | `--target-url` | Target LangGraph Cloud deployment URL |
 | `--api-key` | LangSmith API key (or set in `.env`) |
-| `--export-json FILE` | Export threads to JSON file only |
+| `--database-url` | PostgreSQL URL (or set in `.env`) |
+| `--export-json FILE` | Export threads to JSON file |
+| `--export-postgres` | Export threads to PostgreSQL database |
 | `--import-json FILE` | Import threads from JSON file |
 | `--migrate` | Migrate threads (export + import) |
 | `--full` | Full migration (export + import + validate) |
 | `--validate` | Compare source vs target thread counts |
 | `--dry-run` | Simulation mode (no changes made) |
 | `--test-single` | Process only one thread (for testing) |
-| `--backup-file` | Backup file path (default: `threads_backup.json`) |
+
+## PostgreSQL Schema
+
+When using `--export-postgres`, the tool creates:
+
+```sql
+-- Threads table
+CREATE TABLE langgraph_threads (
+    id SERIAL PRIMARY KEY,
+    thread_id VARCHAR(255) UNIQUE NOT NULL,
+    metadata JSONB DEFAULT '{}',
+    values JSONB DEFAULT '{}',
+    created_at TIMESTAMP,
+    updated_at TIMESTAMP,
+    source_url TEXT,
+    exported_at TIMESTAMP DEFAULT NOW()
+);
+
+-- Checkpoints table
+CREATE TABLE langgraph_checkpoints (
+    id SERIAL PRIMARY KEY,
+    thread_id VARCHAR(255) REFERENCES langgraph_threads(thread_id),
+    checkpoint_id VARCHAR(255),
+    parent_checkpoint_id VARCHAR(255),
+    checkpoint_data JSONB DEFAULT '{}',
+    values JSONB DEFAULT '{}',
+    metadata JSONB DEFAULT '{}',
+    created_at TIMESTAMP
+);
+```
+
+## Example Output
+
+```
+╭────────────────────────────────────────╮
+│ 🔄 LangGraph Threads Export Tool       │
+╰────────────────────────────────────────╯
+
+╭─────────────────────────────────────────╮
+│ Phase 1: Export threads from source     │
+╰─────────────────────────────────────────╯
+✓ 66 threads found
+✓ JSON backup saved: threads_backup.json
+✓ Size: 29.30 MB
+✓ Total checkpoints exported: 842
+✓ PostgreSQL: 66 threads, 842 checkpoints
+```
 
 ## Important Notes
 
 ### Authentication
 
-If your LangGraph deployment uses custom authentication (e.g., Auth0), you may need to temporarily disable it during migration:
+If your LangGraph deployment uses custom authentication (e.g., Auth0), you may need to temporarily disable it during export:
 
 ```json
 // langgraph.json - temporarily set auth to null
@@ -143,68 +204,23 @@ If your LangGraph deployment uses custom authentication (e.g., Auth0), you may n
 }
 ```
 
-Remember to re-enable authentication after migration!
-
-### Thread Status
-
-Imported threads may initially show as "Interrupted" in LangGraph Studio. This is normal - the status will change to "Idle" after the first interaction.
+Remember to re-enable authentication after!
 
 ### Multi-tenancy
 
-The tool preserves `metadata.owner`, so each user will only see their own threads after migration. Make sure your target deployment has the same authentication setup.
+The tool preserves `metadata.owner`, so each user will only see their own threads after migration.
 
 ### Rate Limiting
 
-The tool includes built-in rate limiting (0.2-0.3s delays) to avoid overwhelming the API. For large migrations (1000+ threads), consider running during off-peak hours.
-
-## Example Output
-
-```
-╭────────────────────────────────────────╮
-│ 🔄 LangGraph Threads Migration Tool    │
-╰────────────────────────────────────────╯
-
-╭─────────────────────────────────────────╮
-│ Phase 1: Export threads from source     │
-╰─────────────────────────────────────────╯
-✓ 66 threads found
-✓ Backup saved: threads_backup.json
-✓ Size: 29.30 MB
-
-╭────────────────────────────────────────╮
-│ Phase 2: Import 66 threads to target   │
-╰────────────────────────────────────────╯
-         Import Summary
-┏━━━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━┓
-┃ Status                   ┃ Count  ┃
-┡━━━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━┩
-│ Created successfully     │     66 │
-│ Already exists (skipped) │      0 │
-│ Errors                   │      0 │
-│ Total                    │     66 │
-└──────────────────────────┴────────┘
-
-╭─────────────────────────────────────╮
-│ Phase 3: Validate migration         │
-╰─────────────────────────────────────╯
-✓ Migration validated successfully!
-```
+Built-in delays (0.2-0.3s) prevent API overload. For large exports (1000+ threads), consider running during off-peak hours.
 
 ## Troubleshooting
 
-### PermissionDeniedError
-
-- Verify your API key is correct and has access to both deployments
-- Use a Service Key (`lsv2_sk_...`), not a Personal Token
-- Check if custom authentication needs to be disabled temporarily
-
-### ConflictError (409)
-
-Thread already exists in target deployment - this is handled automatically (skipped).
-
-### Thread history not migrated
-
-Currently, thread history (checkpoints) is exported but the full checkpoint chain may not be restored. Messages and metadata are preserved.
+| Error | Solution |
+|-------|----------|
+| `PermissionDeniedError` | Use Service Key (`lsv2_sk_...`), not Personal Token |
+| `ConflictError (409)` | Thread already exists (automatically skipped) |
+| `asyncpg not installed` | Run `pip install asyncpg` for PostgreSQL support |
 
 ## Contributing
 
