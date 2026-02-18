@@ -99,7 +99,7 @@ class JSONExporter(BaseExporter):
         if not path.exists():
             raise FileNotFoundError(f"File not found: {file_path}")
 
-        data = json.loads(path.read_text())
+        data = json.loads(path.read_text(encoding="utf-8"), strict=False)
         threads = data.get("threads", [])
         return [ThreadData.from_dict(t) for t in threads]
 
@@ -110,7 +110,7 @@ class JSONExporter(BaseExporter):
         if not path.exists():
             raise FileNotFoundError(f"File not found: {file_path}")
 
-        data = json.loads(path.read_text())
+        data = json.loads(path.read_text(encoding="utf-8"), strict=False)
         return {
             "export_date": data.get("export_date"),
             "source": data.get("source"),
