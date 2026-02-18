@@ -33,7 +33,7 @@ console = Console()
 
 async def run_export_json(
     source_url: str,
-    api_key: str,
+    source_api_key: str,
     output_file: str,
     test_single: bool = False,
 ) -> None:
@@ -43,7 +43,7 @@ async def run_export_json(
         border_style="cyan",
     ))
 
-    async with ThreadMigrator(source_url=source_url, api_key=api_key) as migrator:
+    async with ThreadMigrator(source_url=source_url, source_api_key=source_api_key) as migrator:
         json_exporter = migrator.add_json_exporter(output_file)
 
         with Progress(
@@ -70,7 +70,7 @@ async def run_export_json(
 
 async def run_export_postgres(
     source_url: str,
-    api_key: str,
+    source_api_key: str,
     database_url: str,
     output_file: str,
     test_single: bool = False,
@@ -81,7 +81,7 @@ async def run_export_postgres(
         border_style="cyan",
     ))
 
-    async with ThreadMigrator(source_url=source_url, api_key=api_key) as migrator:
+    async with ThreadMigrator(source_url=source_url, source_api_key=source_api_key) as migrator:
         json_exporter = migrator.add_json_exporter(output_file)
         pg_exporter = migrator.add_postgres_exporter(database_url)
 
@@ -112,7 +112,7 @@ async def run_export_postgres(
 
 async def run_import_json(
     target_url: str,
-    api_key: str,
+    target_api_key: str,
     input_file: str,
     dry_run: bool = False,
 ) -> None:
@@ -133,7 +133,7 @@ async def run_import_json(
     if dry_run:
         console.print("\n[yellow]⚠ DRY-RUN MODE: No changes will be made[/yellow]")
 
-    async with ThreadMigrator(target_url=target_url, api_key=api_key) as migrator:
+    async with ThreadMigrator(target_url=target_url, target_api_key=target_api_key) as migrator:
         with Progress(
             SpinnerColumn(),
             TextColumn("[progress.description]{task.description}"),
@@ -169,7 +169,8 @@ async def run_import_json(
 async def run_full_migration(
     source_url: str,
     target_url: str,
-    api_key: str,
+    source_api_key: str,
+    target_api_key: str,
     backup_file: str,
     dry_run: bool = False,
     test_single: bool = False,
@@ -184,7 +185,8 @@ async def run_full_migration(
     async with ThreadMigrator(
         source_url=source_url,
         target_url=target_url,
-        api_key=api_key,
+        source_api_key=source_api_key,
+        target_api_key=target_api_key,
     ) as migrator:
         json_exporter = migrator.add_json_exporter(backup_file)
 
@@ -298,7 +300,8 @@ async def run_full_migration(
 async def run_validate(
     source_url: str,
     target_url: str,
-    api_key: str,
+    source_api_key: str,
+    target_api_key: str,
 ) -> None:
     """Validate migration by comparing thread counts."""
     console.print(Panel.fit(
@@ -309,7 +312,8 @@ async def run_validate(
     async with ThreadMigrator(
         source_url=source_url,
         target_url=target_url,
-        api_key=api_key,
+        source_api_key=source_api_key,
+        target_api_key=target_api_key,
     ) as migrator:
         validation = await migrator.validate_migration()
 
@@ -343,8 +347,12 @@ Examples:
   # Export to PostgreSQL
   python migrate_threads.py --source-url https://my.langgraph.app --export-postgres
 
-  # Full migration
+  # Full migration (same org)
   python migrate_threads.py --source-url https://prod.langgraph.app --target-url https://dev.langgraph.app --full
+
+  # Full migration (cross-org, separate API keys)
+  python migrate_threads.py --source-url https://org1.langgraph.app --target-url https://org2.langgraph.app \\
+      --source-api-key lsv2_sk_... --target-api-key lsv2_sk_... --full
 
   # Import from JSON
   python migrate_threads.py --target-url https://dev.langgraph.app --import-json backup.json
@@ -353,7 +361,9 @@ Examples:
 
     parser.add_argument("--source-url", help="Source LangGraph deployment URL")
     parser.add_argument("--target-url", help="Target LangGraph deployment URL")
-    parser.add_argument("--api-key", help="LangSmith API key (or set LANGSMITH_API_KEY)")
+    parser.add_argument("--api-key", help="Shared API key fallback (or set LANGSMITH_API_KEY)")
+    parser.add_argument("--source-api-key", help="Source API key (or set LANGSMITH_SOURCE_API_KEY)")
+    parser.add_argument("--target-api-key", help="Target API key (or set LANGSMITH_TARGET_API_KEY)")
     parser.add_argument("--database-url", help="PostgreSQL URL (or set DATABASE_URL)")
 
     parser.add_argument("--export-json", metavar="FILE", help="Export to JSON file")
@@ -368,12 +378,29 @@ Examples:
 
     args = parser.parse_args()
 
-    # Load from environment if not provided
-    api_key = args.api_key or os.getenv("LANGSMITH_API_KEY")
+    # Resolve API keys: CLI flag > specific env var > shared CLI flag > shared env var
+    shared_key = args.api_key or os.getenv("LANGSMITH_API_KEY")
+    source_api_key = (
+        args.source_api_key
+        or os.getenv("LANGSMITH_SOURCE_API_KEY")
+        or shared_key
+    )
+    target_api_key = (
+        args.target_api_key
+        or os.getenv("LANGSMITH_TARGET_API_KEY")
+        or shared_key
+    )
     database_url = args.database_url or os.getenv("DATABASE_URL")
 
-    if not api_key:
-        console.print("[red]✗ LANGSMITH_API_KEY required[/red]")
+    # Validate keys based on the command
+    needs_source = bool(args.export_json or args.export_postgres or args.full or args.validate)
+    needs_target = bool(args.import_json or args.full or args.validate)
+
+    if needs_source and not source_api_key:
+        console.print("[red]✗ Source API key required (--source-api-key or LANGSMITH_SOURCE_API_KEY or LANGSMITH_API_KEY)[/red]")
+        sys.exit(1)
+    if needs_target and not target_api_key:
+        console.print("[red]✗ Target API key required (--target-api-key or LANGSMITH_TARGET_API_KEY or LANGSMITH_API_KEY)[/red]")
         sys.exit(1)
 
     # Display header
@@ -381,6 +408,10 @@ Examples:
         "[bold magenta]🔄 LangGraph Threads Export Tool[/bold magenta]",
         border_style="magenta",
     ))
+
+    # Show key info (cross-org vs same-org)
+    if needs_source and needs_target and source_api_key != target_api_key:
+        console.print("[cyan]ℹ Cross-org migration: using separate API keys for source and target[/cyan]\n")
 
     if args.test_single:
         console.print("[yellow]⚠ TEST MODE: Single thread only[/yellow]\n")
@@ -392,7 +423,10 @@ Examples:
                 console.print("[red]✗ --source-url required[/red]")
                 sys.exit(1)
             asyncio.run(run_export_json(
-                args.source_url, api_key, args.export_json, args.test_single
+                source_url=args.source_url,
+                source_api_key=source_api_key,
+                output_file=args.export_json,
+                test_single=args.test_single,
             ))
 
         elif args.export_postgres:
@@ -403,7 +437,11 @@ Examples:
                 console.print("[red]✗ --database-url or DATABASE_URL required[/red]")
                 sys.exit(1)
             asyncio.run(run_export_postgres(
-                args.source_url, api_key, database_url, args.backup_file, args.test_single
+                source_url=args.source_url,
+                source_api_key=source_api_key,
+                database_url=database_url,
+                output_file=args.backup_file,
+                test_single=args.test_single,
             ))
 
         elif args.import_json:
@@ -411,7 +449,10 @@ Examples:
                 console.print("[red]✗ --target-url required[/red]")
                 sys.exit(1)
             asyncio.run(run_import_json(
-                args.target_url, api_key, args.import_json, args.dry_run
+                target_url=args.target_url,
+                target_api_key=target_api_key,
+                input_file=args.import_json,
+                dry_run=args.dry_run,
             ))
 
         elif args.full:
@@ -419,15 +460,25 @@ Examples:
                 console.print("[red]✗ Both --source-url and --target-url required[/red]")
                 sys.exit(1)
             asyncio.run(run_full_migration(
-                args.source_url, args.target_url, api_key,
-                args.backup_file, args.dry_run, args.test_single
+                source_url=args.source_url,
+                target_url=args.target_url,
+                source_api_key=source_api_key,
+                target_api_key=target_api_key,
+                backup_file=args.backup_file,
+                dry_run=args.dry_run,
+                test_single=args.test_single,
             ))
 
         elif args.validate:
             if not args.source_url or not args.target_url:
                 console.print("[red]✗ Both --source-url and --target-url required[/red]")
                 sys.exit(1)
-            asyncio.run(run_validate(args.source_url, args.target_url, api_key))
+            asyncio.run(run_validate(
+                source_url=args.source_url,
+                target_url=args.target_url,
+                source_api_key=source_api_key,
+                target_api_key=target_api_key,
+            ))
 
         else:
             parser.print_help()

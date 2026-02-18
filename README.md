@@ -59,8 +59,12 @@ cp .env.example .env
 Edit `.env` with your credentials:
 
 ```bash
-# Required: LangSmith API key
+# Required: LangSmith API key (shared fallback for source and target)
 LANGSMITH_API_KEY=lsv2_sk_your_api_key_here
+
+# For cross-org migration: separate keys override the shared key
+# LANGSMITH_SOURCE_API_KEY=lsv2_sk_source_org_key
+# LANGSMITH_TARGET_API_KEY=lsv2_sk_target_org_key
 
 # Optional: PostgreSQL connection URL (for --export-postgres)
 DATABASE_URL=postgresql://user:password@localhost:5432/dbname
@@ -99,9 +103,18 @@ This creates two tables:
 Transfer all threads from one deployment to another:
 
 ```bash
+# Same org (shared API key)
 python migrate_threads.py \
   --source-url https://my-prod.langgraph.app \
   --target-url https://my-dev.langgraph.app \
+  --full
+
+# Cross-org (separate API keys)
+python migrate_threads.py \
+  --source-url https://org1.langgraph.app \
+  --target-url https://org2.langgraph.app \
+  --source-api-key lsv2_sk_source... \
+  --target-api-key lsv2_sk_target... \
   --full
 ```
 
@@ -132,7 +145,9 @@ python migrate_threads.py \
 |----------|-------------|
 | `--source-url` | Source LangGraph Cloud deployment URL |
 | `--target-url` | Target LangGraph Cloud deployment URL |
-| `--api-key` | LangSmith API key (or set in `.env`) |
+| `--api-key` | Shared API key fallback (or `LANGSMITH_API_KEY`) |
+| `--source-api-key` | Source API key for cross-org (or `LANGSMITH_SOURCE_API_KEY`) |
+| `--target-api-key` | Target API key for cross-org (or `LANGSMITH_TARGET_API_KEY`) |
 | `--database-url` | PostgreSQL URL (or set in `.env`) |
 | `--export-json FILE` | Export threads to JSON file |
 | `--export-postgres` | Export threads to PostgreSQL database |

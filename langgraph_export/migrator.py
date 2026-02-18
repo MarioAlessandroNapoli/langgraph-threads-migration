@@ -28,6 +28,8 @@ class ThreadMigrator:
         source_url: Optional[str] = None,
         target_url: Optional[str] = None,
         api_key: str = "",
+        source_api_key: Optional[str] = None,
+        target_api_key: Optional[str] = None,
         rate_limit_delay: float = 0.2,
     ):
         """
@@ -36,12 +38,15 @@ class ThreadMigrator:
         Args:
             source_url: Source LangGraph deployment URL
             target_url: Target LangGraph deployment URL (for migration)
-            api_key: LangSmith API key
+            api_key: Shared API key (fallback for source/target)
+            source_api_key: API key for source deployment (overrides api_key)
+            target_api_key: API key for target deployment (overrides api_key)
             rate_limit_delay: Delay between API calls (seconds)
         """
         self.source_url = source_url
         self.target_url = target_url
-        self.api_key = api_key
+        self.source_api_key = source_api_key or api_key
+        self.target_api_key = target_api_key or api_key
         self.rate_limit_delay = rate_limit_delay
 
         self._source_client: Optional[LangGraphClient] = None
@@ -58,11 +63,11 @@ class ThreadMigrator:
         await self.close()
 
     async def connect(self) -> None:
-        """Initialize clients."""
+        """Initialize clients with their respective API keys."""
         if self.source_url:
-            self._source_client = LangGraphClient(self.source_url, self.api_key)
+            self._source_client = LangGraphClient(self.source_url, self.source_api_key)
         if self.target_url:
-            self._target_client = LangGraphClient(self.target_url, self.api_key)
+            self._target_client = LangGraphClient(self.target_url, self.target_api_key)
 
     async def close(self) -> None:
         """Close all clients and exporters."""
