@@ -5,6 +5,8 @@ Main class for orchestrating thread export and migration operations.
 """
 
 import asyncio
+import logging
+import random
 from typing import Any, Callable, Dict, List, Optional
 
 from langgraph_sdk.errors import ConflictError, APIStatusError
@@ -78,6 +80,29 @@ class ThreadMigrator:
         for exporter in self._exporters:
             await exporter.close()
 
+    @staticmethod
+    async def _retry(coro_factory, max_attempts=3, base_delay=1.0, label=""):
+        """
+        Retry an async call with exponential backoff + jitter.
+
+        Args:
+            coro_factory: Callable that returns a new coroutine each call
+            max_attempts: Maximum number of attempts
+            base_delay: Base delay in seconds (doubles each retry)
+            label: Label for log messages
+        """
+        last_error = None
+        for attempt in range(max_attempts):
+            try:
+                return await coro_factory()
+            except Exception as e:
+                last_error = e
+                if attempt < max_attempts - 1:
+                    delay = base_delay * (2 ** attempt) * (0.7 + random.random() * 0.6)
+                    logging.warning(f"Retry {attempt + 1}/{max_attempts} for {label}: {e} (wait {delay:.1f}s)")
+                    await asyncio.sleep(delay)
+        raise last_error
+
     def add_json_exporter(self, output_file: str = "threads_backup.json") -> JSONExporter:
         """
         Add JSON file exporter.
@@ -109,6 +134,8 @@ class ThreadMigrator:
     async def fetch_all_threads(
         self,
         limit: Optional[int] = None,
+        metadata_filter: Optional[Dict[str, Any]] = None,
+        history_limit: Optional[int] = None,
         progress_callback: Optional[Callable[[int, str], None]] = None,
     ) -> List[ThreadData]:
         """
@@ -116,6 +143,8 @@ class ThreadMigrator:
 
         Args:
             limit: Maximum number of threads to fetch (None = all)
+            metadata_filter: Optional metadata dict for server-side filtering
+            history_limit: Max checkpoints per thread (None = all)
             progress_callback: Optional callback(count, message) for progress updates
 
         Returns:
@@ -128,14 +157,15 @@ class ThreadMigrator:
         offset = 0
         batch_size = 100 if limit is None else min(limit, 100)
 
-        # Fetch thread list
         while True:
             if progress_callback:
                 progress_callback(len(all_threads), f"Fetching threads (offset={offset})...")
 
-            threads = await self._source_client.search_threads(
-                limit=batch_size,
-                offset=offset,
+            threads = await self._retry(
+                lambda o=offset: self._source_client.search_threads(
+                    limit=batch_size, offset=o, metadata=metadata_filter,
+                ),
+                label="search_threads",
             )
 
             if not threads:
@@ -147,9 +177,16 @@ class ThreadMigrator:
                     continue
 
                 try:
-                    # Get full thread details
-                    details = await self._source_client.get_thread(thread_id)
-                    history = await self._source_client.get_thread_history(thread_id)
+                    details = await self._retry(
+                        lambda tid=thread_id: self._source_client.get_thread(tid),
+                        label=f"get_thread({thread_id[:8]})",
+                    )
+                    history = await self._retry(
+                        lambda tid=thread_id: self._source_client.get_all_history(
+                            tid, limit=history_limit,
+                        ),
+                        label=f"get_all_history({thread_id[:8]})",
+                    )
 
                     thread_data = ThreadData(
                         thread_id=thread_id,
@@ -169,18 +206,16 @@ class ThreadMigrator:
 
                 except Exception as e:
                     if progress_callback:
-                        progress_callback(len(all_threads), f"Error: {thread_id}: {e}")
+                        progress_callback(len(all_threads), f"Skipped {thread_id[:8]}: {e}")
                     continue
 
                 await asyncio.sleep(self.rate_limit_delay)
 
-                # Check limit
                 if limit and len(all_threads) >= limit:
                     return all_threads
 
             offset += len(threads)
 
-            # No more pages
             if len(threads) < batch_size:
                 break
 
@@ -192,6 +227,8 @@ class ThreadMigrator:
         self,
         threads: Optional[List[ThreadData]] = None,
         limit: Optional[int] = None,
+        metadata_filter: Optional[Dict[str, Any]] = None,
+        history_limit: Optional[int] = None,
         progress_callback: Optional[Callable[[int, str], None]] = None,
     ) -> ExportStats:
         """
@@ -200,14 +237,20 @@ class ThreadMigrator:
         Args:
             threads: Pre-fetched threads (if None, fetches from source)
             limit: Maximum number of threads to export
+            metadata_filter: Optional metadata dict for server-side filtering
+            history_limit: Max checkpoints per thread (None = all)
             progress_callback: Optional callback for progress updates
 
         Returns:
             Combined export statistics
         """
-        # Fetch threads if not provided
         if threads is None:
-            threads = await self.fetch_all_threads(limit, progress_callback)
+            threads = await self.fetch_all_threads(
+                limit=limit,
+                metadata_filter=metadata_filter,
+                history_limit=history_limit,
+                progress_callback=progress_callback,
+            )
 
         # Connect all exporters
         for exporter in self._exporters:
@@ -514,14 +557,10 @@ class ThreadMigrator:
         # Validate checkpoint history for a sample thread
         if check_history and sample_thread_id:
             if self._source_client:
-                src_history = await self._source_client.get_thread_history(
-                    sample_thread_id, limit=1000
-                )
+                src_history = await self._source_client.get_all_history(sample_thread_id)
                 result["history_source"] = len(src_history)
             if self._target_client:
-                tgt_history = await self._target_client.get_thread_history(
-                    sample_thread_id, limit=1000
-                )
+                tgt_history = await self._target_client.get_all_history(sample_thread_id)
                 result["history_target"] = len(tgt_history)
 
         return result

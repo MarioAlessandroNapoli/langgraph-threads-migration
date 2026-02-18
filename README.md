@@ -21,6 +21,10 @@ This tool solves all of these problems.
 - **Test mode** - Export/migrate a single thread first to verify everything works
 - **Dry-run mode** - Preview changes without making any modifications
 - **Progress tracking** - Real-time progress bars and detailed summaries
+- **Metadata filtering** - Export only threads matching specific metadata (e.g., by workspace)
+- **Retry with backoff** - Automatic retries on API failures (3 attempts with exponential backoff)
+- **Streaming JSON** - Memory-efficient export that writes threads incrementally to disk
+- **Full history pagination** - Fetches complete checkpoint history regardless of thread size
 
 ## Use Cases
 
@@ -31,6 +35,7 @@ This tool solves all of these problems.
 | Store in your own PostgreSQL | `--export-postgres` |
 | Environment migration (staging → prod) | `--migrate` |
 | Disaster recovery | `--import-json backup.json` |
+| Export single workspace (multi-tenant) | `--metadata-filter '{"workspace_id": 4}'` |
 
 ## Installation
 
@@ -128,6 +133,24 @@ python migrate_threads.py \
   --import-json threads_backup.json
 ```
 
+### Filter by metadata
+
+Export only threads matching specific metadata (useful for multi-tenant deployments):
+
+```bash
+# Export threads for a specific workspace
+python migrate_threads.py \
+  --source-url https://my-deployment.langgraph.app \
+  --export-json workspace_4.json \
+  --metadata-filter '{"workspace_id": 4}'
+
+# Export threads owned by a specific user
+python migrate_threads.py \
+  --source-url https://my-deployment.langgraph.app \
+  --export-json user_backup.json \
+  --metadata-filter '{"owner": "user@example.com"}'
+```
+
 ### Test with a single thread first
 
 Always recommended before a full operation:
@@ -157,6 +180,8 @@ python migrate_threads.py \
 | `--validate` | Compare source vs target thread counts |
 | `--dry-run` | Simulation mode (no changes made) |
 | `--test-single` | Process only one thread (for testing) |
+| `--metadata-filter JSON` | Filter threads by metadata (JSONB containment) |
+| `--history-limit N` | Max checkpoints per thread (default: all) |
 
 ## PostgreSQL Schema
 
@@ -224,9 +249,9 @@ Remember to re-enable authentication after!
 
 The tool preserves `metadata.owner`, so each user will only see their own threads after migration.
 
-### Rate Limiting
+### Rate Limiting & Retry
 
-Built-in delays (0.2-0.3s) prevent API overload. For large exports (1000+ threads), consider running during off-peak hours.
+Built-in delays (0.2s) between API calls prevent overload. Failed API calls are retried up to 3 times with exponential backoff (1s, 2s, 4s + jitter). For large exports (1000+ threads), consider running during off-peak hours.
 
 ## Troubleshooting
 

@@ -13,8 +13,10 @@ Usage:
 
 import argparse
 import asyncio
+import json
 import os
 import sys
+from typing import Optional
 
 from dotenv import load_dotenv
 from rich.console import Console
@@ -36,12 +38,17 @@ async def run_export_json(
     source_api_key: str,
     output_file: str,
     test_single: bool = False,
+    metadata_filter: Optional[dict] = None,
+    history_limit: Optional[int] = None,
 ) -> None:
     """Export threads to JSON file."""
     console.print(Panel.fit(
         "[bold cyan]Exporting threads to JSON[/bold cyan]",
         border_style="cyan",
     ))
+
+    if metadata_filter:
+        console.print(f"[cyan]Metadata filter:[/cyan] {metadata_filter}")
 
     async with ThreadMigrator(source_url=source_url, source_api_key=source_api_key) as migrator:
         json_exporter = migrator.add_json_exporter(output_file)
@@ -59,9 +66,13 @@ async def run_export_json(
                 progress.update(task, completed=count, description=f"[cyan]{message}")
 
             limit = 1 if test_single else None
-            stats = await migrator.export_threads(limit=limit, progress_callback=update_progress)
+            stats = await migrator.export_threads(
+                limit=limit,
+                metadata_filter=metadata_filter,
+                history_limit=history_limit,
+                progress_callback=update_progress,
+            )
 
-        # Display results
         console.print(f"\n[green]✓[/green] Threads exported: {stats.threads_exported}")
         console.print(f"[green]✓[/green] Checkpoints exported: {stats.checkpoints_exported}")
         console.print(f"[green]✓[/green] Output file: [bold]{output_file}[/bold]")
@@ -74,12 +85,17 @@ async def run_export_postgres(
     database_url: str,
     output_file: str,
     test_single: bool = False,
+    metadata_filter: Optional[dict] = None,
+    history_limit: Optional[int] = None,
 ) -> None:
     """Export threads to PostgreSQL (and JSON backup)."""
     console.print(Panel.fit(
         "[bold cyan]Exporting threads to PostgreSQL[/bold cyan]",
         border_style="cyan",
     ))
+
+    if metadata_filter:
+        console.print(f"[cyan]Metadata filter:[/cyan] {metadata_filter}")
 
     async with ThreadMigrator(source_url=source_url, source_api_key=source_api_key) as migrator:
         json_exporter = migrator.add_json_exporter(output_file)
@@ -98,7 +114,12 @@ async def run_export_postgres(
                 progress.update(task, completed=count, description=f"[cyan]{message}")
 
             limit = 1 if test_single else None
-            stats = await migrator.export_threads(limit=limit, progress_callback=update_progress)
+            stats = await migrator.export_threads(
+                limit=limit,
+                metadata_filter=metadata_filter,
+                history_limit=history_limit,
+                progress_callback=update_progress,
+            )
 
         # Get PostgreSQL stats
         db_stats = await pg_exporter.get_database_stats()
@@ -174,13 +195,17 @@ async def run_full_migration(
     backup_file: str,
     dry_run: bool = False,
     test_single: bool = False,
+    metadata_filter: Optional[dict] = None,
+    history_limit: Optional[int] = None,
 ) -> None:
     """Full migration: export + import + validate."""
-    # Phase 1: Export
     console.print(Panel.fit(
         "[bold cyan]Phase 1: Export threads from source[/bold cyan]",
         border_style="cyan",
     ))
+
+    if metadata_filter:
+        console.print(f"[cyan]Metadata filter:[/cyan] {metadata_filter}")
 
     async with ThreadMigrator(
         source_url=source_url,
@@ -203,9 +228,15 @@ async def run_full_migration(
                 progress.update(task, completed=count, description=f"[cyan]{message}")
 
             limit = 1 if test_single else None
-            threads = await migrator.fetch_all_threads(limit=limit, progress_callback=update_progress)
+            threads = await migrator.fetch_all_threads(
+                limit=limit,
+                metadata_filter=metadata_filter,
+                history_limit=history_limit,
+                progress_callback=update_progress,
+            )
 
-        # Export to JSON
+        # Export to JSON backup
+        await json_exporter.connect()
         for thread in threads:
             await json_exporter.export_thread(thread)
         await json_exporter.finalize()
@@ -375,6 +406,10 @@ Examples:
     parser.add_argument("--backup-file", default="threads_backup.json", help="Backup file path")
     parser.add_argument("--dry-run", action="store_true", help="Simulation mode")
     parser.add_argument("--test-single", action="store_true", help="Test with single thread")
+    parser.add_argument("--metadata-filter", metavar="JSON",
+                        help="Filter threads by metadata (JSON string, e.g. '{\"workspace_id\": 4}')")
+    parser.add_argument("--history-limit", type=int, default=None,
+                        help="Max checkpoints per thread (default: all)")
 
     args = parser.parse_args()
 
@@ -391,6 +426,20 @@ Examples:
         or shared_key
     )
     database_url = args.database_url or os.getenv("DATABASE_URL")
+
+    # Parse metadata filter
+    metadata_filter = None
+    if args.metadata_filter:
+        try:
+            metadata_filter = json.loads(args.metadata_filter)
+            if not isinstance(metadata_filter, dict):
+                console.print("[red]✗ --metadata-filter must be a JSON object[/red]")
+                sys.exit(1)
+        except json.JSONDecodeError as e:
+            console.print(f"[red]✗ Invalid JSON in --metadata-filter: {e}[/red]")
+            sys.exit(1)
+
+    history_limit = args.history_limit
 
     # Validate keys based on the command
     needs_source = bool(args.export_json or args.export_postgres or args.full or args.validate)
@@ -427,6 +476,8 @@ Examples:
                 source_api_key=source_api_key,
                 output_file=args.export_json,
                 test_single=args.test_single,
+                metadata_filter=metadata_filter,
+                history_limit=history_limit,
             ))
 
         elif args.export_postgres:
@@ -442,6 +493,8 @@ Examples:
                 database_url=database_url,
                 output_file=args.backup_file,
                 test_single=args.test_single,
+                metadata_filter=metadata_filter,
+                history_limit=history_limit,
             ))
 
         elif args.import_json:
@@ -467,6 +520,8 @@ Examples:
                 backup_file=args.backup_file,
                 dry_run=args.dry_run,
                 test_single=args.test_single,
+                metadata_filter=metadata_filter,
+                history_limit=history_limit,
             ))
 
         elif args.validate:

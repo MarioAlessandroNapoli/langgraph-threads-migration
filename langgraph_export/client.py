@@ -70,19 +70,83 @@ class LangGraphClient:
         self,
         thread_id: str,
         limit: int = 100,
+        before: Optional[Dict[str, Any]] = None,
     ) -> List[Dict[str, Any]]:
         """
-        Get full thread history (checkpoints).
+        Get thread history (checkpoints) — single page.
 
         Args:
             thread_id: Thread ID
             limit: Maximum number of checkpoints to return
+            before: Checkpoint cursor for pagination
 
         Returns:
-            List of checkpoint dictionaries
+            List of checkpoint dictionaries (most-recent-first)
         """
-        history = await self._client.threads.get_history(thread_id, limit=limit)
+        kwargs: Dict[str, Any] = {"limit": limit}
+        if before:
+            kwargs["before"] = before
+
+        history = await self._client.threads.get_history(thread_id, **kwargs)
         return list(history) if history else []
+
+    async def get_all_history(
+        self,
+        thread_id: str,
+        limit: Optional[int] = None,
+        page_size: int = 100,
+    ) -> List[Dict[str, Any]]:
+        """
+        Get complete thread history with automatic pagination.
+
+        Paginates using the `before` cursor until all checkpoints
+        are retrieved or the optional limit is reached.
+
+        Args:
+            thread_id: Thread ID
+            limit: Max total checkpoints (None = all)
+            page_size: Checkpoints per API call
+
+        Returns:
+            List of all checkpoint dictionaries (most-recent-first)
+        """
+        all_history: List[Dict[str, Any]] = []
+        before = None
+
+        while True:
+            batch_size = page_size
+            if limit:
+                remaining = limit - len(all_history)
+                batch_size = min(page_size, remaining)
+
+            batch = await self.get_thread_history(
+                thread_id, limit=batch_size, before=before,
+            )
+
+            if not batch:
+                break
+
+            all_history.extend(batch)
+
+            if limit and len(all_history) >= limit:
+                break
+
+            if len(batch) < batch_size:
+                break
+
+            # Cursor: use the last (oldest) checkpoint in this batch
+            last = batch[-1]
+            checkpoint_config = last.get("checkpoint", {})
+            if not checkpoint_config:
+                # Fallback: build cursor from checkpoint_id
+                cp_id = last.get("checkpoint_id")
+                if not cp_id:
+                    break
+                checkpoint_config = {"checkpoint_id": cp_id}
+
+            before = checkpoint_config
+
+        return all_history
 
     async def create_thread(
         self,
