@@ -105,6 +105,41 @@ class LangGraphClient:
         )
         return dict(thread) if thread else {}
 
+    async def create_thread_with_history(
+        self,
+        thread_id: str,
+        metadata: Optional[Dict[str, Any]] = None,
+        supersteps: Optional[List[Dict[str, Any]]] = None,
+        if_exists: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Create a new thread with pre-populated checkpoint history.
+
+        Uses the supersteps parameter to replay state updates,
+        reconstructing the full checkpoint chain on the target.
+
+        Args:
+            thread_id: Thread ID to use
+            metadata: Optional metadata to attach
+            supersteps: List of supersteps, each containing updates
+                        with values and as_node
+            if_exists: Conflict behavior ('raise' or 'do_nothing')
+
+        Returns:
+            Created thread dictionary
+        """
+        kwargs: Dict[str, Any] = {
+            "thread_id": thread_id,
+            "metadata": metadata or {},
+        }
+        if supersteps:
+            kwargs["supersteps"] = supersteps
+        if if_exists:
+            kwargs["if_exists"] = if_exists
+
+        thread = await self._client.threads.create(**kwargs)
+        return dict(thread) if thread else {}
+
     async def update_thread_state(
         self,
         thread_id: str,

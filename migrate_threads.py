@@ -160,7 +160,8 @@ async def run_import_json(
         table.add_row("Created", str(results["created"]))
         table.add_row("Skipped (exists)", str(results["skipped"]))
         table.add_row("Failed", str(results["failed"]))
-        table.add_row("Total", str(len(threads)))
+        table.add_row("Checkpoints", str(results.get("checkpoints", 0)))
+        table.add_row("Total threads", str(len(threads)))
 
         console.print(table)
 
@@ -245,6 +246,7 @@ async def run_full_migration(
         table.add_row("Created", str(results["created"]))
         table.add_row("Skipped (exists)", str(results["skipped"]))
         table.add_row("Failed", str(results["failed"]))
+        table.add_row("Checkpoints", str(results.get("checkpoints", 0)))
 
         console.print(table)
 
@@ -254,21 +256,43 @@ async def run_full_migration(
             border_style="blue",
         ))
 
-        validation = await migrator.validate_migration()
+        # For test-single, also validate checkpoint history
+        sample_id = threads[0].thread_id if test_single and threads else None
+        validation = await migrator.validate_migration(
+            check_history=bool(sample_id),
+            sample_thread_id=sample_id,
+        )
 
         table = Table(title="Validation")
-        table.add_column("Deployment", style="cyan")
-        table.add_column("Threads", justify="right", style="magenta")
+        table.add_column("Metric", style="cyan")
+        table.add_column("Source", justify="right", style="magenta")
+        table.add_column("Target", justify="right", style="magenta")
 
-        table.add_row("Source", str(validation["source_count"]))
-        table.add_row("Target", str(validation["target_count"]))
+        table.add_row(
+            "Threads",
+            str(validation["source_count"]),
+            str(validation["target_count"]),
+        )
+        if "history_source" in validation:
+            table.add_row(
+                f"Checkpoints ({sample_id[:8]}...)",
+                str(validation["history_source"]),
+                str(validation["history_target"]),
+            )
 
         console.print(table)
 
         if validation["difference"] <= 0:
-            console.print("[green]✓ Migration validated successfully![/green]")
+            console.print("[green]✓ Thread count validated![/green]")
         else:
             console.print(f"[yellow]⚠ Target has {validation['difference']} fewer threads[/yellow]")
+
+        if "history_source" in validation:
+            if validation["history_source"] == validation["history_target"]:
+                console.print("[green]✓ Checkpoint history validated![/green]")
+            else:
+                diff = validation["history_source"] - validation["history_target"]
+                console.print(f"[yellow]⚠ History mismatch: {diff} checkpoints missing[/yellow]")
 
 
 async def run_validate(

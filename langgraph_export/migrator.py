@@ -229,6 +229,168 @@ class ThreadMigrator:
         )
         return stats
 
+    @staticmethod
+    def _compute_values_delta(
+        prev_values: Dict[str, Any],
+        curr_values: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """
+        Compute the delta between two checkpoint states.
+
+        For messages (add_messages reducer): extracts only new messages by ID.
+        For lists of dicts with 'id' field: extracts only new items by ID.
+        For all other fields: includes only if changed.
+        """
+        delta: Dict[str, Any] = {}
+
+        for key, curr_val in curr_values.items():
+            prev_val = prev_values.get(key)
+
+            if curr_val == prev_val:
+                continue
+
+            if key == "messages":
+                # add_messages reducer: diff by message ID
+                prev_ids = {
+                    m.get("id") for m in (prev_val or []) if isinstance(m, dict)
+                }
+                new_msgs = [
+                    m for m in (curr_val or [])
+                    if isinstance(m, dict) and m.get("id") not in prev_ids
+                ]
+                if new_msgs:
+                    delta["messages"] = new_msgs
+
+            elif (
+                isinstance(curr_val, list)
+                and curr_val
+                and isinstance(curr_val[0], dict)
+                and "id" in curr_val[0]
+            ):
+                # List of dicts with ID → dedup-aware delta
+                prev_ids = {
+                    item.get("id")
+                    for item in (prev_val or [])
+                    if isinstance(item, dict)
+                }
+                new_items = [
+                    item for item in curr_val
+                    if isinstance(item, dict) and item.get("id") not in prev_ids
+                ]
+                if new_items:
+                    delta[key] = new_items
+
+            else:
+                # Scalar or non-ID list → include if changed
+                delta[key] = curr_val
+
+        return delta
+
+    @staticmethod
+    def _history_to_supersteps(
+        history: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """
+        Convert checkpoint history to supersteps format for threads.create().
+
+        History from get_history() is most-recent-first.
+        Supersteps must be chronological (oldest-first).
+
+        Strategy:
+        - If metadata.writes is available (local checkpointer), use it directly.
+        - Otherwise (Cloud API), compute deltas between consecutive states.
+        Only state-changing steps produce supersteps; middleware no-ops are skipped.
+        """
+        if not history:
+            return []
+
+        chronological = list(reversed(history))
+        supersteps: List[Dict[str, Any]] = []
+
+        # Check if writes data is available (first non-empty checkpoint)
+        has_writes = any(
+            isinstance((h.get("metadata") or {}).get("writes"), dict)
+            for h in history
+        )
+
+        if has_writes:
+            # Direct approach: use metadata.writes
+            for state in chronological:
+                metadata = state.get("metadata") or {}
+                writes = metadata.get("writes")
+                if not writes or not isinstance(writes, dict):
+                    continue
+                updates = []
+                for node_name, node_values in writes.items():
+                    if node_values is None:
+                        continue
+                    updates.append({"values": node_values, "as_node": node_name})
+                if updates:
+                    supersteps.append({"updates": updates})
+        else:
+            # Delta approach: compute diffs between consecutive states
+            prev_values: Dict[str, Any] = {}
+            for i, state in enumerate(chronological):
+                curr_values = state.get("values") or {}
+
+                if i == 0:
+                    # Include initial state as first superstep
+                    if curr_values:
+                        supersteps.append({
+                            "updates": [{
+                                "values": curr_values,
+                                "as_node": "__start__",
+                            }],
+                        })
+                    prev_values = curr_values
+                    continue
+
+                # as_node = what the previous checkpoint's next field says ran
+                prev_next = chronological[i - 1].get("next", [])
+                as_node = prev_next[0] if prev_next else "__unknown__"
+
+                delta = ThreadMigrator._compute_values_delta(prev_values, curr_values)
+
+                if delta:
+                    supersteps.append({
+                        "updates": [{"values": delta, "as_node": as_node}],
+                    })
+
+                prev_values = curr_values
+
+        return supersteps
+
+    async def _import_thread_with_history(
+        self,
+        thread: ThreadData,
+    ) -> int:
+        """
+        Import a single thread using supersteps to preserve checkpoint history.
+
+        Returns the number of checkpoints imported.
+        Raises on failure so caller can handle fallback.
+        """
+        supersteps = self._history_to_supersteps(thread.history)
+
+        await self._target_client.create_thread_with_history(
+            thread_id=thread.thread_id,
+            metadata=thread.metadata,
+            supersteps=supersteps if supersteps else None,
+        )
+        return len(supersteps)
+
+    async def _import_thread_legacy(self, thread: ThreadData) -> None:
+        """Fallback: create thread + update_state (no history preservation)."""
+        await self._target_client.create_thread(
+            thread_id=thread.thread_id,
+            metadata=thread.metadata,
+        )
+        if thread.values:
+            await self._target_client.update_thread_state(
+                thread_id=thread.thread_id,
+                values=thread.values,
+            )
+
     async def import_threads(
         self,
         threads: List[ThreadData],
@@ -238,43 +400,61 @@ class ThreadMigrator:
         """
         Import threads to target deployment.
 
+        Tries supersteps-based import first to preserve checkpoint history.
+        Falls back to legacy create+update_state if the target API
+        doesn't support supersteps.
+
         Args:
             threads: Threads to import
             dry_run: If True, don't actually create threads
             progress_callback: Optional callback for progress updates
 
         Returns:
-            Dictionary with created, skipped, failed counts
+            Dictionary with created, skipped, failed, checkpoints counts
         """
         if not self._target_client:
             raise RuntimeError("Target URL not configured")
 
-        results = {"created": 0, "skipped": 0, "failed": 0}
+        results = {"created": 0, "skipped": 0, "failed": 0, "checkpoints": 0}
+        use_legacy = False
 
         for i, thread in enumerate(threads):
             try:
                 if dry_run:
+                    supersteps = self._history_to_supersteps(thread.history)
                     results["skipped"] += 1
                     if progress_callback:
-                        progress_callback(i + 1, f"[DRY-RUN] Would create {thread.thread_id[:8]}...")
+                        progress_callback(
+                            i + 1,
+                            f"[DRY-RUN] Would create {thread.thread_id[:8]}... "
+                            f"({len(supersteps)} supersteps)"
+                        )
                     continue
 
-                # Create thread
-                await self._target_client.create_thread(
-                    thread_id=thread.thread_id,
-                    metadata=thread.metadata,
-                )
-
-                # Update state if available
-                if thread.values:
-                    await self._target_client.update_thread_state(
-                        thread_id=thread.thread_id,
-                        values=thread.values,
-                    )
+                if not use_legacy:
+                    try:
+                        checkpoints = await self._import_thread_with_history(thread)
+                        results["checkpoints"] += checkpoints
+                    except APIStatusError as e:
+                        # supersteps not supported — switch to legacy for all remaining
+                        if e.status_code in (400, 422):
+                            use_legacy = True
+                            if progress_callback:
+                                progress_callback(
+                                    i + 1,
+                                    "supersteps not supported, falling back to legacy import"
+                                )
+                            await self._import_thread_legacy(thread)
+                        else:
+                            raise
+                else:
+                    await self._import_thread_legacy(thread)
 
                 results["created"] += 1
                 if progress_callback:
-                    progress_callback(i + 1, f"Created {thread.thread_id[:8]}...")
+                    cp_count = len(thread.history)
+                    mode = "legacy" if use_legacy else f"{cp_count} checkpoints"
+                    progress_callback(i + 1, f"Created {thread.thread_id[:8]}... ({mode})")
 
             except ConflictError:
                 results["skipped"] += 1
@@ -295,12 +475,19 @@ class ThreadMigrator:
 
         return results
 
-    async def validate_migration(self) -> Dict[str, int]:
+    async def validate_migration(
+        self,
+        check_history: bool = False,
+        sample_thread_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
         """
         Compare thread counts between source and target.
 
+        Optionally validates checkpoint history for a sample thread.
+
         Returns:
-            Dictionary with source_count, target_count
+            Dictionary with source_count, target_count, and optionally
+            history_source/history_target for the sample thread.
         """
         source_count = 0
         target_count = 0
@@ -313,8 +500,23 @@ class ThreadMigrator:
             threads = await self._target_client.search_threads(limit=10000)
             target_count = len(threads)
 
-        return {
+        result: Dict[str, Any] = {
             "source_count": source_count,
             "target_count": target_count,
             "difference": source_count - target_count,
         }
+
+        # Validate checkpoint history for a sample thread
+        if check_history and sample_thread_id:
+            if self._source_client:
+                src_history = await self._source_client.get_thread_history(
+                    sample_thread_id, limit=1000
+                )
+                result["history_source"] = len(src_history)
+            if self._target_client:
+                tgt_history = await self._target_client.get_thread_history(
+                    sample_thread_id, limit=1000
+                )
+                result["history_target"] = len(tgt_history)
+
+        return result
